@@ -31,7 +31,7 @@ jobs:
           PUPPETEER_SKIP_DOWNLOAD: 'true'
 
       - name: DB smoke test
-        run: npm run rebuild:node && npm run smoke:db
+        run: npm run rebuild:node && node test/smoke-db.mjs
         env:
           PUPPETEER_SKIP_DOWNLOAD: 'true'
 
