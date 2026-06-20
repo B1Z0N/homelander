@@ -22,8 +22,11 @@ jobs:
         env:
           PUPPETEER_SKIP_DOWNLOAD: 'true'
 
+      - name: Install setuptools (for node-gyp on Python 3.12+)
+        run: pip3 install --break-system-packages setuptools
+
       - name: Test
-        run: npm test
+        run: npm run rebuild:node && npm run test:unit && npm run test:i18n
         env:
           PUPPETEER_SKIP_DOWNLOAD: 'true'
 

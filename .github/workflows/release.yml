@@ -50,6 +50,10 @@ jobs:
         env:
           PUPPETEER_SKIP_DOWNLOAD: 'true'
 
+      - name: Install setuptools (for node-gyp on Python 3.12+)
+        if: ${{ github.event.inputs.platforms == 'all' || github.event.inputs.platforms == matrix.platform }}
+        run: pip3 install --break-system-packages setuptools
+
       - name: Rebuild native modules for Electron
         if: ${{ github.event.inputs.platforms == 'all' || github.event.inputs.platforms == matrix.platform }}
         run: npm run rebuild:electron
