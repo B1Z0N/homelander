@@ -190,6 +190,8 @@ npm run dist:linux             # Linux .deb + .AppImage
 - **never use system Chrome** — always the Puppeteer-bundled Chromium
 - **do not poll IS24 login pages** — login flow is bot-sensitive; use plain Chromium process without CDP
 - **Tauschwohnung listings immune to captcha wall** — recognized in URL translator, ideal for reliable sends
+- **Picked-area `geocodes=` replace the path region** — the mobile API unions comma-separated geocodes, so sending both widens the search back to the whole city; `bbox` intersects with them and 412s without any geocode
+- **Drawn `shape=` must be decoded, `bbox=` must not** — both are IS24 base64 (`/`→`-`, `+`→`_`, `=`→`.`) over encoded polylines, but the mobile API takes `bbox` in either form and answers 400 for an encoded `shape`; multiple drawn areas travel as one `;`-joined value (repeating the param is a 412)
 - **Per-form login check** — daemon checks IS24 login state before each apply, not just at startup
 - **HTML snapshots are raw-copied in support bundles (no redaction)** — blocked on Electron main thread if regex-heavy
 

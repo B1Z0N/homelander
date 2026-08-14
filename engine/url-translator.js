@@ -140,10 +140,14 @@ const PREVIEW_I18N = {
       any: 'any',
       selected: 'selected',
       radiusSuffix: (km) => `${km} km radius`,
+      selectedAreas: (n) => (n === 1 ? '1 selected area' : `${n} selected areas`),
+      drawnAreas: (n) => (n === 1 ? '1 drawn area' : `${n} drawn areas`),
+      mapArea: 'map area',
       unsupportedFilters: 'Unsupported IS24 search filters',
       mobileRejects: (label) => `The IS24 mobile API rejects ${label} filters; Homelander keeps the supported parts of the search.`,
       radiusMissingCoordinates: 'This radius link is missing its map coordinates. Open the search on immobilienscout24.de and copy the URL from the results page again.',
-      shapeUnsupported: 'Map-drawn (shape) searches are not supported. Open the search on immobilienscout24.de, switch to a radius or district search, and copy that URL instead.',
+      bboxMissingRegion: 'This map-area link is missing its region. Open the search on immobilienscout24.de and copy the URL from the results page again.',
+      shapeMissingOutline: 'This map-drawn link is missing the outline you drew. Open the search on immobilienscout24.de and copy the URL from the results page again.',
     },
   },
   de: {
@@ -194,10 +198,14 @@ const PREVIEW_I18N = {
       any: 'egal',
       selected: 'ausgewählt',
       radiusSuffix: (km) => `${km} km Umkreis`,
+      selectedAreas: (n) => (n === 1 ? '1 ausgewähltes Gebiet' : `${n} ausgewählte Gebiete`),
+      drawnAreas: (n) => (n === 1 ? '1 gezeichnetes Gebiet' : `${n} gezeichnete Gebiete`),
+      mapArea: 'Kartenausschnitt',
       unsupportedFilters: 'Nicht unterstützte IS24-Suchfilter',
       mobileRejects: (label) => `Die IS24 Mobile API lehnt Filter für ${label} ab; Homelander übernimmt die unterstützten Teile der Suche.`,
       radiusMissingCoordinates: 'Diesem Umkreis-Link fehlen die Kartenkoordinaten. Öffne die Suche auf immobilienscout24.de und kopiere die URL erneut aus der Ergebnisliste.',
-      shapeUnsupported: 'Auf der Karte gezeichnete Suchen (Shape) werden nicht unterstützt. Wechsle auf immobilienscout24.de zu einer Umkreis- oder Stadtteilsuche und kopiere diese URL.',
+      bboxMissingRegion: 'Diesem Kartenausschnitt-Link fehlt die Region. Öffne die Suche auf immobilienscout24.de und kopiere die URL erneut aus der Ergebnisliste.',
+      shapeMissingOutline: 'Diesem gezeichneten Link fehlt der Umriss. Öffne die Suche auf immobilienscout24.de und kopiere die URL erneut aus der Ergebnisliste.',
     },
   },
 };
@@ -478,6 +486,83 @@ function parseGeoCoordinates(raw) {
   return { lat, lon, radiusKm };
 }
 
+// IS24's district picker ("filter_suggestions") keeps the container region in
+// the path and puts the actually selected areas in geocodes= as numeric IDs.
+// Leading zeroes are significant: the mobile API answers 0200000005056 and
+// rejects 200000005056 with a 412. Returns null for anything that is not a
+// plain ID list, so the caller can surface it rather than fall back to the
+// container region — that would silently search the whole city.
+function parseGeocodeIds(raw) {
+  const values = splitValues(raw);
+  if (!values.length) return null;
+  if (!values.every(v => /^\d{4,20}$/.test(v))) return null;
+  return [...new Set(values)];
+}
+
+// bbox carries the map viewport as an encoded polyline rectangle. Homelander
+// forwards it verbatim — the mobile API accepts the web's own encoding — so it
+// only needs to be checked for characters that survive a query string intact.
+function isBboxValue(raw) {
+  const value = String(raw ?? '').trim();
+  return value !== '' && /^[A-Za-z0-9+/=_.~-]+$/.test(value);
+}
+
+// Google-encoded polyline → [[lat, lon], …], or null for anything malformed.
+// Homelander decodes only to prove a drawn shape survived IS24's transport
+// encoding intact — what it sends the mobile API is the polyline string itself,
+// never these points.
+function decodePolylinePoints(encoded) {
+  const points = [];
+  let index = 0;
+  let lat = 0;
+  let lon = 0;
+  while (index < encoded.length) {
+    const deltas = [];
+    for (let axis = 0; axis < 2; axis++) {
+      let shift = 0;
+      let result = 0;
+      let byte = 0x20;
+      while (byte >= 0x20) {
+        // Truncated pair, runaway varint, or a character below the polyline
+        // alphabet — all mean this is not a polyline, so stop rather than guess.
+        if (index >= encoded.length || shift > 30) return null;
+        byte = encoded.charCodeAt(index++) - 63;
+        if (byte < 0) return null;
+        result |= (byte & 0x1f) << shift;
+        shift += 5;
+      }
+      deltas.push((result & 1) ? ~(result >> 1) : (result >> 1));
+    }
+    lat += deltas[0];
+    lon += deltas[1];
+    points.push([lat / 1e5, lon / 1e5]);
+  }
+  return points;
+}
+
+// Map-drawn searches carry their outlines in shape=, base64 over one or more
+// polylines joined by ';' (two drawn areas → two polylines). IS24's base64 is
+// URL-transport-safe: '/'→'-', '+'→'_', '='→'.'. The mobile API answers 400 for
+// that encoded form and 200 for the polylines themselves, so unlike bbox this
+// one has to be unwrapped — and therefore verified, since a bad unwrap would
+// send the API an outline that is not the one the user drew.
+function parseShape(raw) {
+  const value = String(raw ?? '').trim();
+  if (!value || !/^[A-Za-z0-9+/=_.~-]+$/.test(value)) return null;
+  const polyline = Buffer
+    .from(value.replace(/-/g, '/').replace(/_/g, '+').replace(/\./g, '='), 'base64')
+    .toString('latin1');
+  const polygons = polyline.split(';');
+  if (polygons.some(polygon => !polygon)) return null;
+  for (const polygon of polygons) {
+    const points = decodePolylinePoints(polygon);
+    // Fewer than three corners cannot enclose an area.
+    if (!points || points.length < 3) return null;
+    if (!points.every(([lat, lon]) => lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180)) return null;
+  }
+  return { polyline, polygonCount: polygons.length };
+}
+
 // centerofsearchaddress is display-only: IS24 varies its separators between
 // URL shapes, so parse defensively. The value never reaches the mobile API,
 // so a wrong guess about the format is cosmetic, never functional.
@@ -583,13 +668,6 @@ export function parseSearchUrl(webUrl) {
       ? rawGeocodeParts.slice(1)
       : rawGeocodeParts;
 
-    // Shape searches need a polygon param the mobile API calls `shape`, which
-    // Homelander does not translate — every shape URL either 412s or arrives
-    // with an unknown `shape` param. Say so instead of building a dead URL.
-    if (searchType === 'shape') {
-      return emptyResult(PREVIEW_I18N.en.labels.shapeUnsupported, 'shapeUnsupported');
-    }
-
     const canonical = {
       originalUrl: url.toString(),
       realEstateType: REALESTATE_TYPE_MAP[realEstatePathType] || 'apartmentrent',
@@ -598,6 +676,9 @@ export function parseSearchUrl(webUrl) {
       location: {
         path: geocodeParts,
         geocode: geocodeParts.length ? `/${geocodeParts.join('/')}` : '',
+        geocodes: [],
+        bbox: null,
+        shape: null,
         label: geocodeParts.length ? geocodeParts.filter(p => p !== 'de').map(titleizeSlug).join(' / ') : 'All Germany',
         center: null,
       },
@@ -690,6 +771,23 @@ export function parseSearchUrl(webUrl) {
           unsupportedParams.push({ key: rawKey, value, risk: 'dangerous' });
         }
         seenKnownKeys.add(key);
+      } else if (key === 'geocodes') {
+        const ids = parseGeocodeIds(value);
+        if (ids) canonical.location.geocodes = ids;
+        else unsupportedParams.push({ key: rawKey, value, risk: 'dangerous' });
+        seenKnownKeys.add(key);
+      } else if (key === 'shape') {
+        // Mirrors geocoordinates: the outline itself decides the search type, so
+        // a shape= param without a /shape/ path segment still works. An outline
+        // Homelander cannot read is still a drawn search — blocked below rather
+        // than dropped, which would search far outside what the user drew.
+        canonical.location.shape = parseShape(value);
+        canonical.searchType = 'shape';
+        seenKnownKeys.add(key);
+      } else if (key === 'bbox') {
+        if (isBboxValue(value)) canonical.location.bbox = String(value).trim();
+        else unsupportedParams.push({ key: rawKey, value, risk: 'dangerous' });
+        seenKnownKeys.add(key);
       } else if (key === 'centerofsearchaddress') {
         centerAddress = formatCenterAddress(value);
         seenKnownKeys.add(key);
@@ -707,8 +805,20 @@ export function parseSearchUrl(webUrl) {
       canonical.location.label = centerAddress || `${lat.toFixed(3)}, ${lon.toFixed(3)}`;
     }
 
+    if (canonical.searchType === 'shape' && !canonical.location.shape) {
+      return emptyResult(PREVIEW_I18N.en.labels.shapeMissingOutline, 'shapeMissingOutline');
+    }
+
     if (canonical.searchType === 'radius' && !canonical.location.center) {
       return emptyResult(PREVIEW_I18N.en.labels.radiusMissingCoordinates, 'radiusMissingCoordinates');
+    }
+
+    // The mobile API answers 412 for a bbox that no region bounds. Dropping the
+    // bbox instead would quietly search far beyond the map the user was looking
+    // at, so say what is missing rather than run a wider search.
+    if (!canonical.location.center && canonical.location.bbox
+      && !canonical.location.geocodes.length && !canonical.location.geocode) {
+      return emptyResult(PREVIEW_I18N.en.labels.bboxMissingRegion, 'bboxMissingRegion');
     }
 
     canonical.heatingTypes = [...new Set(canonical.heatingTypes)];
@@ -724,14 +834,28 @@ export function parseSearchUrl(webUrl) {
 export function buildMobileApiUrl(canonical, { page = 1, pageSize = 20, includeListControls = true } = {}) {
   const params = new URLSearchParams();
   const center = canonical.location?.center;
+  const shape = canonical.location?.shape;
   if (center) {
     // The API requires geocoordinates for a radius search and ignores geocodes
     // when both are present — omit geocodes rather than rely on that precedence.
     params.set('searchType', 'radius');
     params.set('geocoordinates', `${center.lat};${center.lon};${center.radiusKm}`);
+  } else if (shape) {
+    // Multiple drawn areas travel as one ';'-joined value; repeating shape= is a
+    // 412. The API ignores geocodes here, so the outline stands alone.
+    params.set('searchType', 'shape');
+    params.set('shape', shape.polyline);
   } else {
-    if (canonical.location?.geocode) params.set('geocodes', canonical.location.geocode);
+    // Picked areas replace the path region instead of joining it: the API unions
+    // comma-separated geocodes, so sending both would widen the search back to
+    // the whole container region the picker started from.
+    const geocodes = canonical.location?.geocodes?.length
+      ? canonical.location.geocodes.join(',')
+      : canonical.location?.geocode;
+    if (geocodes) params.set('geocodes', geocodes);
     params.set('searchType', canonical.searchType || 'region');
+    // bbox intersects with the geocodes and 412s without them.
+    if (geocodes && canonical.location?.bbox) params.set('bbox', canonical.location.bbox);
   }
   params.set('realestatetype', canonical.realEstateType || 'apartmentrent');
   if (canonical.price?.type) params.set('pricetype', canonical.price.type);
@@ -831,10 +955,20 @@ function previewFor(canonical, locale = 'en') {
     const suffix = i18n.labels.radiusSuffix(String(center.radiusKm));
     return { location: `${canonical.location.label} · ${suffix}`, filters };
   }
-  const locationLabel = canonical.location?.label === PREVIEW_I18N.en.labels.allGermany
-    ? i18n.labels.allGermany
-    : (canonical.location?.label || i18n.labels.allGermany);
-  return { location: locationLabel, filters };
+  // A picked-area search keeps its container region in the path, so the path
+  // label alone would claim the whole city — carry it as a prefix instead.
+  const pathLabel = canonical.location?.label;
+  const locationParts = [];
+  if (pathLabel && pathLabel !== PREVIEW_I18N.en.labels.allGermany) locationParts.push(pathLabel);
+  if (canonical.location?.shape) {
+    locationParts.push(i18n.labels.drawnAreas(canonical.location.shape.polygonCount));
+  }
+  if (canonical.location?.geocodes?.length) {
+    locationParts.push(i18n.labels.selectedAreas(canonical.location.geocodes.length));
+  }
+  if (canonical.location?.bbox) locationParts.push(i18n.labels.mapArea);
+  if (!locationParts.length) locationParts.push(i18n.labels.allGermany);
+  return { location: locationParts.join(' · '), filters };
 }
 
 /** Validate a pasted search URL for user-facing import. Blocks dangerous unknown filters. */

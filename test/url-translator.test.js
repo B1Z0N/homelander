@@ -740,11 +740,11 @@ describe('translateUrl — edge cases', () => {
     assert.ok(fullUrl.includes('geocoordinates='));
   });
 
-  it('rejects shape search type — the mobile API cannot run map-drawn polygons', () => {
+  it('rejects a shape search that carries no outline to run', () => {
     const { fullUrl, error } = translateUrl(
       'https://www.immobilienscout24.de/Suche/shape/berlin/wohnung-mieten'
     );
-    assert.match(error, /shape/i);
+    assert.match(error, /outline/i);
     assert.equal(fullUrl, '');
   });
 
@@ -850,6 +850,322 @@ describe('buildMobileApiUrl — radius searches', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Picked-area searches — IS24's district picker puts numeric geocode IDs and a
+// map viewport (bbox) in the query string
+// ---------------------------------------------------------------------------
+
+const PICKED_AREA_URL = 'https://www.immobilienscout24.de/Suche/de/hamburg/hamburg/wohnung-mit-balkon-mieten'
+  + '?haspromotion=false&bbox=cXl2ZUlra2x7QHlrSD8-X2VlQHhrSD8.'
+  + '&geocodes=0200000005056,0200000006057,0200000004051&enteredFrom=filter_suggestions';
+
+describe('parseSearchUrl — picked-area searches', () => {
+  it('accepts the geocodes and bbox the district picker adds', () => {
+    const { canonical, unsupportedParams, error } = parseSearchUrl(PICKED_AREA_URL);
+    assert.equal(error, null);
+    assert.deepEqual(unsupportedParams, []);
+    assert.deepEqual(canonical.location.geocodes, ['0200000005056', '0200000006057', '0200000004051']);
+    assert.equal(canonical.location.bbox, 'cXl2ZUlra2x7QHlrSD8-X2VlQHhrSD8.');
+  });
+
+  it('keeps the container region from the path alongside the picked areas', () => {
+    const { canonical } = parseSearchUrl(PICKED_AREA_URL);
+    assert.equal(canonical.location.geocode, '/de/hamburg/hamburg');
+    assert.equal(canonical.searchType, 'region');
+  });
+
+  it('keeps leading zeroes — the mobile API rejects the trimmed IDs', () => {
+    const { canonical } = parseSearchUrl(
+      'https://www.immobilienscout24.de/Suche/de/hamburg/hamburg/wohnung-mieten?geocodes=0200000005056'
+    );
+    assert.deepEqual(canonical.location.geocodes, ['0200000005056']);
+  });
+
+  it('drops duplicate IDs so the search is not double-counted', () => {
+    const { canonical } = parseSearchUrl(
+      'https://www.immobilienscout24.de/Suche/de/hamburg/hamburg/wohnung-mieten'
+      + '?geocodes=0200000005056,0200000006057,0200000005056'
+    );
+    assert.deepEqual(canonical.location.geocodes, ['0200000005056', '0200000006057']);
+  });
+
+  it('leaves ordinary searches with an empty geocodes list and no bbox', () => {
+    const { canonical } = parseSearchUrl(
+      'https://www.immobilienscout24.de/Suche/de/hamburg/hamburg/altona/wohnung-mieten'
+    );
+    assert.deepEqual(canonical.location.geocodes, []);
+    assert.equal(canonical.location.bbox, null);
+  });
+
+  it('blocks a malformed geocode list instead of falling back to the whole city', () => {
+    const malformed = ['', 'hamburg', '0200000005056,hamburg', '/de/hamburg', '02000000050561234567890'];
+    for (const bad of malformed) {
+      const result = validateSearchUrl(
+        `https://www.immobilienscout24.de/Suche/de/hamburg/hamburg/wohnung-mieten?geocodes=${bad}`
+      );
+      assert.equal(result.ok, false, `expected "${bad}" to be rejected`);
+    }
+  });
+
+  it('blocks a bbox value that would not survive a query string', () => {
+    const result = validateSearchUrl(
+      'https://www.immobilienscout24.de/Suche/de/hamburg/hamburg/wohnung-mieten?bbox=not a bbox'
+    );
+    assert.equal(result.ok, false);
+  });
+});
+
+describe('buildMobileApiUrl — picked-area searches', () => {
+  it('sends the picked areas as one comma-separated geocodes param', () => {
+    const { fullUrl, error } = translateUrl(PICKED_AREA_URL);
+    assert.equal(error, null);
+    const params = new URL(fullUrl).searchParams;
+    assert.equal(params.get('geocodes'), '0200000005056,0200000006057,0200000004051');
+    assert.equal(params.getAll('geocodes').length, 1);
+    assert.equal(params.get('searchType'), 'region');
+  });
+
+  it('replaces the path region rather than adding to it', () => {
+    // The API unions comma-separated geocodes, so keeping /de/hamburg/hamburg
+    // would widen the search back to all of Hamburg.
+    const { fullUrl } = translateUrl(PICKED_AREA_URL);
+    assert.equal(new URL(fullUrl).searchParams.get('geocodes').includes('hamburg'), false);
+  });
+
+  it('forwards the bbox verbatim', () => {
+    const { fullUrl } = translateUrl(PICKED_AREA_URL);
+    assert.equal(new URL(fullUrl).searchParams.get('bbox'), 'cXl2ZUlra2x7QHlrSD8-X2VlQHhrSD8.');
+  });
+
+  it('keeps the other filters of a picked-area search', () => {
+    const params = new URL(translateUrl(PICKED_AREA_URL).fullUrl).searchParams;
+    assert.equal(params.get('realestatetype'), 'apartmentrent');
+    assert.equal(params.get('equipment'), 'balcony');
+    assert.equal(params.get('haspromotion'), 'false');
+  });
+
+  it('sends a bbox with the path region when no areas were picked', () => {
+    const { fullUrl } = translateUrl(
+      'https://www.immobilienscout24.de/Suche/de/hamburg/hamburg/wohnung-mieten'
+      + '?bbox=cXl2ZUlra2x7QHlrSD8-X2VlQHhrSD8.'
+    );
+    const params = new URL(fullUrl).searchParams;
+    assert.equal(params.get('geocodes'), '/de/hamburg/hamburg');
+    assert.equal(params.get('bbox'), 'cXl2ZUlra2x7QHlrSD8-X2VlQHhrSD8.');
+  });
+
+  it('drops geocodes and bbox for a radius search, which carries its own circle', () => {
+    const { fullUrl } = translateUrl(
+      'https://www.immobilienscout24.de/Suche/radius/wohnung-mieten'
+      + '?geocoordinates=53.55073;9.93549;1.0&geocodes=0200000005056&bbox=cXl2ZUlra2x7QHlrSD8-X2VlQHhrSD8.'
+    );
+    const params = new URL(fullUrl).searchParams;
+    assert.equal(params.has('geocodes'), false);
+    assert.equal(params.has('bbox'), false);
+    assert.equal(params.get('geocoordinates'), '53.55073;9.93549;1');
+  });
+
+  it('never sends a bbox the mobile API would reject for want of a region', () => {
+    assert.equal(
+      validateSearchUrl(
+        'https://www.immobilienscout24.de/Suche/wohnung-mieten?bbox=cXl2ZUlra2x7QHlrSD8-X2VlQHhrSD8.'
+      ).mobileUrl,
+      ''
+    );
+  });
+});
+
+describe('validateSearchUrl — picked-area preview', () => {
+  it('names the region, the number of areas, and the map viewport in English', () => {
+    const result = validateSearchUrl(PICKED_AREA_URL);
+    assert.equal(result.ok, true);
+    assert.equal(result.preview.location, 'Hamburg / Hamburg · 3 selected areas · map area');
+  });
+
+  it('names all three in German', () => {
+    const result = validateSearchUrl(PICKED_AREA_URL, { locale: 'de' });
+    assert.equal(result.preview.location, 'Hamburg / Hamburg · 3 ausgewählte Gebiete · Kartenausschnitt');
+  });
+
+  it('does not claim the whole container region on its own', () => {
+    const result = validateSearchUrl(PICKED_AREA_URL);
+    assert.equal(result.preview.location, 'Hamburg / Hamburg · 3 selected areas · map area');
+    assert.notEqual(result.preview.location, 'Hamburg / Hamburg');
+  });
+
+  it('singularizes a one-area search', () => {
+    const url = 'https://www.immobilienscout24.de/Suche/de/hamburg/hamburg/wohnung-mieten?geocodes=0200000005056';
+    assert.match(validateSearchUrl(url).preview.location, /1 selected area$/);
+    assert.match(validateSearchUrl(url, { locale: 'de' }).preview.location, /1 ausgewähltes Gebiet$/);
+  });
+
+  it('never reports a picked-area search as nationwide', () => {
+    const bare = validateSearchUrl(
+      'https://www.immobilienscout24.de/Suche/wohnung-mieten?geocodes=0200000005056'
+    );
+    assert.equal(bare.preview.location, '1 selected area');
+    assert.equal(bare.preview.location.includes('All Germany'), false);
+  });
+
+  it('blocks a bbox with no region to bound it, in both locales', () => {
+    const url = 'https://www.immobilienscout24.de/Suche/wohnung-mieten?bbox=cXl2ZUlra2x7QHlrSD8-X2VlQHhrSD8.';
+    const en = validateSearchUrl(url);
+    assert.equal(en.ok, false);
+    assert.equal(en.errorCode, 'bboxMissingRegion');
+    assert.match(en.error, /missing its region/i);
+    assert.match(validateSearchUrl(url, { locale: 'de' }).error, /fehlt die Region/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Map-drawn searches — IS24 puts the drawn outlines in shape= as base64 over
+// ';'-joined encoded polylines
+// ---------------------------------------------------------------------------
+
+// One hand-drawn polygon around Hamburg (18 corners).
+const SHAPE_ONE_URL = 'https://www.immobilienscout24.de/Suche/shape/wohnung-mieten'
+  + '?shape=b2B_ZUllamp5QGRuSnF8SHB2SGF3TWBzR21nVWxqQnNtVHhiQHFpbEBvYUF5d1Fjd0RxfEh3dkhjfkV1'
+  + 'dk9rYUBfZUlwdUVpe0R8d0Z5ZkRwY0x3aUJmdlRhRHpsUG5iQnZlQHZkQG57aEFmYEVuYEc.';
+
+// Two separate drawn areas in Hamburg, joined by ';' inside the encoding.
+const SHAPE_TWO_URL = 'https://www.immobilienscout24.de/Suche/shape/wohnung-mit-balkon-mieten'
+  + '?shape=e3h7ZUlzfHN7QH5xQGVBZGBAZXVDeWdAe2FDfXZBdXRAbWFAdklrU25yQGVJam5BeGNBZmREO2FkfmVJX'
+  + '2BmfEB8aEF3Z0BuWH1pQH5MfXhAZVdpakJpb0FrfUF7ekB3SWtvQGRuQHFPaHFFbEp2SQ..'
+  + '&numberofrooms=2.0-&price=-1500.0&livingspace=50.0-&pricetype=calculatedtotalrent&enteredFrom=result_list';
+
+const SHAPE_TWO_POLYLINE = '{x{eIs|s{@~q@eAd`@euCyg@{aC}vAut@ma@vIkSnr@eIjnAxcAfdD'
+  + ';ad~eI_`f|@|hAwg@nX}i@~L}x@eWijBioAk}A{z@wIko@dn@qOhqElJvI';
+
+describe('parseSearchUrl — map-drawn searches', () => {
+  it('decodes a single drawn outline', () => {
+    const { canonical, unsupportedParams, error } = parseSearchUrl(SHAPE_ONE_URL);
+    assert.equal(error, null);
+    assert.deepEqual(unsupportedParams, []);
+    assert.equal(canonical.searchType, 'shape');
+    assert.equal(canonical.location.shape.polygonCount, 1);
+  });
+
+  it('keeps two drawn areas as one ";"-joined outline', () => {
+    const { canonical, error } = parseSearchUrl(SHAPE_TWO_URL);
+    assert.equal(error, null);
+    assert.equal(canonical.location.shape.polygonCount, 2);
+    assert.equal(canonical.location.shape.polyline, SHAPE_TWO_POLYLINE);
+  });
+
+  it('keeps the filters that travel with a drawn search', () => {
+    const { canonical } = parseSearchUrl(SHAPE_TWO_URL);
+    assert.deepEqual(canonical.price, { min: null, max: 1500, type: 'calculatedtotalrent' });
+    assert.deepEqual(canonical.rooms, { min: 2, max: null });
+    assert.deepEqual(canonical.livingSpace, { min: 50, max: null });
+    assert.deepEqual(canonical.equipment, ['BALCONY']);
+  });
+
+  it('treats an outline without a /shape/ path segment as a drawn search', () => {
+    const { canonical } = parseSearchUrl(
+      SHAPE_ONE_URL.replace('/Suche/shape/', '/Suche/de/hamburg/hamburg/')
+    );
+    assert.equal(canonical.searchType, 'shape');
+    assert.equal(canonical.location.shape.polygonCount, 1);
+  });
+
+  it('leaves location.shape null for searches that drew nothing', () => {
+    const { canonical } = parseSearchUrl(
+      'https://www.immobilienscout24.de/Suche/de/hamburg/hamburg/wohnung-mieten'
+    );
+    assert.equal(canonical.location.shape, null);
+    assert.equal(canonical.searchType, 'region');
+  });
+
+  it('blocks an outline it cannot read instead of searching a wider area', () => {
+    const malformed = [
+      '',                       // empty
+      'notapolyline',           // decodes to bytes outside the polyline alphabet
+      'cXl2ZUlra2x7QA..',       // a valid polyline, but only two corners
+      'not a shape',            // characters that never survive the query string
+      'e3h7ZUl6',               // truncated coordinate pair
+      'O2Fk',                   // decodes to ";ad" — an empty leading polygon
+    ];
+    for (const bad of malformed) {
+      const result = validateSearchUrl(
+        `https://www.immobilienscout24.de/Suche/shape/wohnung-mieten?shape=${encodeURIComponent(bad)}`
+      );
+      assert.equal(result.ok, false, `expected "${bad}" to be rejected`);
+      assert.equal(result.mobileUrl, '', `expected "${bad}" to build no URL`);
+    }
+  });
+});
+
+describe('buildMobileApiUrl — map-drawn searches', () => {
+  it('sends the decoded polyline, which the API takes in place of the web encoding', () => {
+    const { fullUrl, error } = translateUrl(SHAPE_TWO_URL);
+    assert.equal(error, null);
+    const params = new URL(fullUrl).searchParams;
+    assert.equal(params.get('searchType'), 'shape');
+    assert.equal(params.get('shape'), SHAPE_TWO_POLYLINE);
+  });
+
+  it('sends both drawn areas as a single shape param', () => {
+    const params = new URL(translateUrl(SHAPE_TWO_URL).fullUrl).searchParams;
+    assert.equal(params.getAll('shape').length, 1);
+  });
+
+  it('never forwards the web encoding, which the API answers with 400', () => {
+    const { fullUrl } = translateUrl(SHAPE_TWO_URL);
+    assert.equal(fullUrl.includes('e3h7ZUl'), false);
+  });
+
+  it('omits geocodes, which the API ignores for a drawn search', () => {
+    const { fullUrl } = translateUrl(
+      SHAPE_ONE_URL.replace('/Suche/shape/', '/Suche/de/hamburg/hamburg/')
+    );
+    assert.equal(new URL(fullUrl).searchParams.has('geocodes'), false);
+  });
+
+  it('keeps the other filters of a drawn search', () => {
+    const params = new URL(translateUrl(SHAPE_TWO_URL).fullUrl).searchParams;
+    assert.equal(params.get('realestatetype'), 'apartmentrent');
+    assert.equal(params.get('price'), '-1500');
+    assert.equal(params.get('numberofrooms'), '2-');
+    assert.equal(params.get('livingspace'), '50-');
+    assert.equal(params.get('equipment'), 'balcony');
+  });
+
+  it('lets a radius circle win over an outline, as it does over geocodes', () => {
+    const { fullUrl } = translateUrl(
+      `${SHAPE_ONE_URL}&geocoordinates=53.55073;9.93549;1.0`
+    );
+    const params = new URL(fullUrl).searchParams;
+    assert.equal(params.get('searchType'), 'radius');
+    assert.equal(params.has('shape'), false);
+  });
+});
+
+describe('validateSearchUrl — map-drawn preview', () => {
+  it('counts the drawn areas in English', () => {
+    assert.equal(validateSearchUrl(SHAPE_ONE_URL).preview.location, '1 drawn area');
+    assert.equal(validateSearchUrl(SHAPE_TWO_URL).preview.location, '2 drawn areas');
+  });
+
+  it('counts the drawn areas in German', () => {
+    assert.equal(validateSearchUrl(SHAPE_ONE_URL, { locale: 'de' }).preview.location, '1 gezeichnetes Gebiet');
+    assert.equal(validateSearchUrl(SHAPE_TWO_URL, { locale: 'de' }).preview.location, '2 gezeichnete Gebiete');
+  });
+
+  it('never reports a drawn search as nationwide', () => {
+    const en = validateSearchUrl(SHAPE_TWO_URL);
+    const de = validateSearchUrl(SHAPE_TWO_URL, { locale: 'de' });
+    assert.equal(en.preview.location.includes('All Germany'), false);
+    assert.equal(de.preview.location.includes('Deutschlandweit'), false);
+  });
+
+  it('names the region a drawn search was narrowed inside', () => {
+    const result = validateSearchUrl(
+      SHAPE_ONE_URL.replace('/Suche/shape/', '/Suche/de/hamburg/hamburg/')
+    );
+    assert.equal(result.preview.location, 'Hamburg / Hamburg · 1 drawn area');
+  });
+});
+
 describe('validateSearchUrl — links the mobile API cannot run', () => {
   it('blocks a radius link that carries no coordinates', () => {
     const result = validateSearchUrl(
@@ -866,12 +1182,19 @@ describe('validateSearchUrl — links the mobile API cannot run', () => {
     assert.equal(result.mobileUrl, '');
   });
 
-  it('blocks map-drawn shape links', () => {
+  it('blocks a map-drawn link that carries no outline', () => {
     const result = validateSearchUrl(
       'https://www.immobilienscout24.de/Suche/shape/berlin/wohnung-mieten'
     );
     assert.equal(result.ok, false);
-    assert.match(result.error, /shape/i);
+    assert.match(result.error, /outline/i);
+  });
+
+  it('does not quietly downgrade an outline-less shape link to a city search', () => {
+    const result = validateSearchUrl(
+      'https://www.immobilienscout24.de/Suche/shape/berlin/wohnung-mieten'
+    );
+    assert.equal(result.mobileUrl, '');
   });
 
   it('tags each block with a stable errorCode the UI can localize', () => {
@@ -881,7 +1204,7 @@ describe('validateSearchUrl — links the mobile API cannot run', () => {
     );
     assert.equal(
       validateSearchUrl('https://www.immobilienscout24.de/Suche/shape/berlin/wohnung-mieten').errorCode,
-      'shapeUnsupported'
+      'shapeMissingOutline'
     );
   });
 
@@ -897,8 +1220,8 @@ describe('validateSearchUrl — links the mobile API cannot run', () => {
     const de = validateSearchUrl(
       'https://www.immobilienscout24.de/Suche/shape/berlin/wohnung-mieten', { locale: 'de' }
     );
-    assert.match(de.error, /nicht unterstützt/i);
-    assert.equal(de.error.includes('not supported'), false);
+    assert.match(de.error, /Umriss/);
+    assert.equal(de.error.includes('outline'), false);
   });
 });
 
@@ -1372,6 +1695,55 @@ describe('IS24 live conformance (opt-in)', { skip: process.env.IS24_LIVE_TESTS !
     assert.equal(small.error, null);
     assert.equal(large.error, null);
     assert.ok(small.total <= large.total, `expected ${small.total} <= ${large.total}`);
+  });
+
+  it('picked-area URL reaches the live mobile API with geocodes and bbox intact', async () => {
+    const result = await getTotalResults(PICKED_AREA_URL);
+    assert.equal(result.error, null);
+    assert.equal(typeof result.total, 'number');
+    assert.ok(result.validation.ok);
+    assert.equal(result.validation.unsupportedParams.length, 0);
+  });
+
+  it('picking more areas does not return fewer results', async () => {
+    const base = 'https://www.immobilienscout24.de/Suche/de/hamburg/hamburg/wohnung-mieten?geocodes=';
+    const one = await getTotalResults(`${base}0200000005056`);
+    const two = await getTotalResults(`${base}0200000005056,0200000006057`);
+    assert.equal(one.error, null);
+    assert.equal(two.error, null);
+    assert.ok(one.total <= two.total, `expected ${one.total} <= ${two.total}`);
+  });
+
+  it('a bbox narrows the region it is sent with rather than being ignored', async () => {
+    const base = 'https://www.immobilienscout24.de/Suche/de/hamburg/hamburg/wohnung-mieten';
+    const whole = await getTotalResults(base);
+    const boxed = await getTotalResults(`${base}?bbox=cXl2ZUlra2x7QHlrSD8-X2VlQHhrSD8.`);
+    assert.equal(whole.error, null);
+    assert.equal(boxed.error, null);
+    assert.ok(boxed.total < whole.total, `expected ${boxed.total} < ${whole.total}`);
+  });
+
+  it('a two-polygon drawn URL reaches the live mobile API', async () => {
+    const result = await getTotalResults(SHAPE_TWO_URL);
+    assert.equal(result.error, null);
+    assert.equal(typeof result.total, 'number');
+    assert.ok(result.validation.ok);
+    assert.equal(result.validation.unsupportedParams.length, 0);
+  });
+
+  it('two drawn areas return the sum of the areas drawn separately', async () => {
+    const base = 'https://www.immobilienscout24.de/Suche/shape/wohnung-mieten?shape=';
+    const [first, second] = SHAPE_TWO_POLYLINE.split(';');
+    const encode = (polyline) => Buffer.from(polyline, 'latin1').toString('base64')
+      .replace(/\//g, '-').replace(/\+/g, '_').replace(/=/g, '.');
+    const both = await getTotalResults(`${base}${encodeURIComponent(encode(SHAPE_TWO_POLYLINE))}`);
+    const one = await getTotalResults(`${base}${encodeURIComponent(encode(first))}`);
+    const two = await getTotalResults(`${base}${encodeURIComponent(encode(second))}`);
+    assert.equal(both.error, null);
+    assert.equal(one.error, null);
+    assert.equal(two.error, null);
+    // The two drawn areas do not overlap, so the union is exactly their sum.
+    assert.equal(both.total, one.total + two.total);
   });
 
   it('returned listings obey numeric max-room constraint when attributes are available', async () => {
