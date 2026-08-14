@@ -455,6 +455,14 @@
       "title": "Could not queue retry",
       "message": "Homelander could not queue this listing for retry."
     },
+    "sent": {
+      "title": "Contact request sent",
+      "message": "IS24 confirmed the contact request for this listing."
+    },
+    "dryRun": {
+      "title": "Dry run",
+      "message": "Dry run mode is on, so Homelander prepared this application without sending it."
+    },
     "generic": {
       "title": "Something went wrong",
       "message": "Homelander could not complete that action. Details were logged."

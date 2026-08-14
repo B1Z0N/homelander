@@ -455,6 +455,14 @@
       "title": "Wiederholung konnte nicht eingereiht werden",
       "message": "Homelander konnte diesen Eintrag nicht zur Wiederholung einreihen."
     },
+    "sent": {
+      "title": "Kontaktanfrage gesendet",
+      "message": "IS24 hat die Kontaktanfrage für dieses Inserat bestätigt."
+    },
+    "dryRun": {
+      "title": "Testlauf",
+      "message": "Der Testmodus ist aktiv — Homelander hat diese Bewerbung vorbereitet, aber nicht gesendet."
+    },
     "generic": {
       "title": "Etwas ist schiefgelaufen",
       "message": "Homelander konnte diese Aktion nicht abschließen. Details wurden protokolliert."

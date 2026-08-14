@@ -4,6 +4,18 @@
 // otherwise falls back to English KNOWN map.
 
 const KNOWN = {
+  // Not failures — the daemon stores an outcome detail on success too, and every
+  // detail string is routed through here. Without these, successes classify as GENERIC.
+  SENT: {
+    title: 'Contact request sent',
+    message: 'IS24 confirmed the contact request for this listing.',
+    action: 'No action needed',
+  },
+  DRY_RUN: {
+    title: 'Dry run',
+    message: 'Dry run mode is on, so Homelander prepared this application without sending it.',
+    action: 'No action needed',
+  },
   BACKEND_UNAVAILABLE: {
     title: 'Backend unavailable',
     message: 'Homelander is still starting up. Try again in a moment.',
@@ -121,6 +133,11 @@ function tError(t, code, field) {
   return null;
 }
 
+// SENT/DRY_RUN are outcomes, not failures — callers styling by severity must not paint them red.
+function defaultSeverity(code) {
+  return code === 'SENT' || code === 'DRY_RUN' ? 'info' : 'error';
+}
+
 export function createSupportId(prefix = 'HML') {
   try {
     const bytes = new Uint8Array(4);
@@ -138,6 +155,11 @@ export function classifyError(input, context = {}) {
 
   const operation = context.operation || '';
   const raw = rawErrorText(input).toLowerCase();
+
+  // Success details first — they never carry an operation hint and would otherwise fall to GENERIC.
+  // Sources: is24-contactor 'confirmed (modal)' / 'confirmed (success text)', daemon 'modal ✓'.
+  if (/^confirmed\b/.test(raw) || raw.startsWith('modal ✓')) return 'SENT';
+  if (raw.startsWith('dry run')) return 'DRY_RUN';
 
   if (operation.includes('chrome') || operation.includes('browser')) {
     if (raw.includes('not responding') || raw.includes('target closed') || raw.includes('websocket') || raw.includes('cdp')) return 'BROWSER_NOT_RESPONDING';
@@ -201,7 +223,7 @@ export function toUserError(input, context = {}, t) {
   const code = classifyError(input, context);
   const base = KNOWN[code] || KNOWN.GENERIC;
   return {
-    severity: context.severity || 'error',
+    severity: context.severity || defaultSeverity(code),
     code,
     title: tError(t, code, 'title') || base.title,
     message: tError(t, code, 'message') || base.message,
