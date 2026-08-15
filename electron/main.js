@@ -11,6 +11,9 @@ import { homedir, platform } from 'node:os';
 import { randomUUID, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { ChromeManager } from './chrome.js';
+import { MessageComposer, DEFAULT_AI_PROMPT, PROMPT_VARIABLES } from '../engine/message-composer.js';
+import { detectHarnesses } from '../engine/harness-detect.js';
+import { createProvider } from '../engine/ai-providers.js';
 import { createSupportId, rawErrorText, redact, toUserError } from '../src/shared/userErrors.js';
 import { openSharedDb, closeSharedDb, db } from './db-service.js';
 
@@ -143,6 +146,7 @@ function encryptConfigSecrets(cfg) {
   const secretFields = [
     ['captcha', 'api_key'],
     ['is24', 'password'],
+    ['ai', 'api_key'],
   ];
   for (const [section, key] of secretFields) {
     const val = cfg[section]?.[key];
@@ -160,6 +164,7 @@ function decryptConfigSecrets(cfg) {
   const secretFields = [
     ['captcha', 'api_key'],
     ['is24', 'password'],
+    ['ai', 'api_key'],
   ];
   for (const [section, key] of secretFields) {
     const val = cfg[section]?.[key];
@@ -467,6 +472,30 @@ function getDefaultConfig() {
       'Mit freundlichen Grüßen',
       '{{name}}',
     ].join('\n'),
+    // AI message composition. Disabled by default — when off (or on any
+    // failure) the daemon uses message_template unchanged.
+    //
+    // `primary` and `fallback` are independent attempts: each picks its own
+    // harness, model, and reasoning level, so the fallback can be a different
+    // agent entirely. Model/thought level start empty — the real values come
+    // from whatever the chosen harness advertises (ACP session config options).
+    ai: {
+      enabled: false,
+      provider: 'acp',          // 'acp' | 'openai-compatible'
+      timeout_seconds: 90,
+      prompt: '',               // blank = built-in layout instructions
+      primary: { harness_id: '', command: '', args: [], model: '', thought_level: '' },
+      fallback: { harness_id: '', command: '', args: [], model: '', thought_level: '' },
+      // provider: acp
+      cwd: '',
+      env: {},
+      auth_method_id: '',
+      // provider: openai-compatible
+      base_url: '',
+      api_key: '',
+      headers: {},
+      max_tokens: 1024,
+    },
     timing: {
       speed: 'balanced',
       overrides: {},
@@ -1272,6 +1301,7 @@ function registerIpcHandlers() {
       const msg = { type: 'config_update' };
 
       if (patch.message_template !== undefined) msg.message_template = config.message_template;
+      if (patch.ai) msg.ai = config.ai;
       if (patch.captcha) msg.captcha = config.captcha;
       if (patch.polling?.interval_seconds !== undefined) msg.poll_interval = config.polling.interval_seconds;
       if (patch.polling?.exclude_tauschwohnungen !== undefined) msg.exclude_tauschwohnungen = config.polling.exclude_tauschwohnungen;
@@ -1393,6 +1423,75 @@ function registerIpcHandlers() {
       return { valid: false, balance: 0, ...gracefulFailure('captcha:validate', err, { code: 'CAPTCHA_KEY_INVALID' }) };
     }
   });
+  // Which ACP harnesses are installed on this machine (PATH scan, no spawn).
+  ipcMain.handle('ai:detect-harnesses', () => {
+    try {
+      return { harnesses: detectHarnesses(), error: null };
+    } catch (err) {
+      return { harnesses: [], ...gracefulFailure('ai:detect-harnesses', err, { code: 'AI_DETECT_FAILED' }) };
+    }
+  });
+
+  // The built-in prompt, so Settings can show and reset to it. The renderer
+  // cannot import engine modules (they pull in node:fs), hence the IPC.
+  ipcMain.handle('ai:default-prompt', () => ({
+    prompt: DEFAULT_AI_PROMPT,
+    variables: PROMPT_VARIABLES,
+    error: null,
+  }));
+
+  // Ask a harness what it offers for a session: models and reasoning levels
+  // (ACP session config options). This does spawn the harness, unlike
+  // detection, so it only runs on demand.
+  ipcMain.handle('ai:probe-harness', async (_e, payload) => {
+    const { ai: aiPatch, attempt } = payload || {};
+    const ai = { ...(config.ai || {}), ...(aiPatch || {}) };
+    let provider = null;
+    try {
+      provider = createProvider({ ai, attempt: attempt || {}, log: (m) => console.log(`[ai:probe] ${m}`) });
+      const result = await provider.listConfig();
+      return { ...result, error: null };
+    } catch (err) {
+      return { models: [], thoughtLevels: [], ...gracefulFailure('ai:probe-harness', err, { code: 'AI_PROBE_FAILED' }) };
+    } finally {
+      try { provider?.dispose(); } catch { /* already gone */ }
+    }
+  });
+
+  // Dry-run the AI message composition against a sample listing so the user
+  // can verify the harness/endpoint before it runs on a real application.
+  ipcMain.handle('ai:test', async (_e, payload) => {
+    const { ai: aiPatch, listing } = payload || {};
+    const composer = new MessageComposer({
+      config: {
+        ...config,
+        ai: { ...(config.ai || {}), ...(aiPatch || {}), enabled: true },
+      },
+      log: (m) => console.log(`[ai:test] ${m}`),
+    });
+    try {
+      const result = await composer.compose(listing || {
+        title: 'Schöne 3-Zimmer-Wohnung mit Balkon',
+        address: 'Musterstraße 42, 10115 Berlin',
+        price: '1.250 € warm',
+        size: '78 m²',
+        rooms: '3',
+        _contact: config.persona || {},
+      });
+      if (result.source !== 'ai') {
+        return {
+          ok: false,
+          ...gracefulFailure('ai:test', new Error(result.errors.join('; ') || 'AI returned no usable message'), { code: 'AI_TEST_FAILED' }),
+        };
+      }
+      return { ok: true, text: result.text, attempt: result.attempt, language: result.language, error: null };
+    } catch (err) {
+      return { ok: false, ...gracefulFailure('ai:test', err, { code: 'AI_TEST_FAILED' }) };
+    } finally {
+      composer.dispose();
+    }
+  });
+
   ipcMain.handle('setup:complete', () => {
     return { complete: setupComplete };
   });

@@ -22,6 +22,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { setPriority, constants as osConstants } from 'node:os';
+import { MessageComposer, renderTemplate } from './message-composer.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -143,12 +144,9 @@ function jitter(min, max) {
   return sleep(min + Math.random() * (max - min));
 }
 
-function personaliseMessage(template, listing) {
-  return template
-    .replace(/\{\{title\}\}/g, listing.title || '')
-    .replace(/\{\{address\}\}/g, listing.address || '')
-    .replace(/\{\{name\}\}/g, [listing._contact?.vorname, listing._contact?.nachname].filter(Boolean).join(' ').trim());
-}
+// Template substitution lives in message-composer.js so the AI path and the
+// fallback path can never drift apart.
+const personaliseMessage = renderTemplate;
 
 /** Shallow merge for config patches received via IPC. */
 function mergePatch(target, patch) {
@@ -218,6 +216,10 @@ let cdpFailCount = 0;
 
 // Mutable config — all fields hot-reload without restart
 let currentConfig = null;
+
+// Drafts the contact-form message: AI when configured, template otherwise.
+// Created in main() once the config is loaded.
+let composer = null;
 
 // Nachrichten pre-flight runs before apply work on every daemon run/resume.
 let nachrichtenSyncDone = false;
@@ -289,11 +291,20 @@ async function ensureNachrichtenSync(db) {
 // ── Apply one listing ──────────────────────────────────────────
 
 async function applyOne(listing, filterId, db) {
-  // Use currentConfig so template/captcha edits take effect immediately
-  const message = personaliseMessage(currentConfig.message_template, {
+  // Use currentConfig so template/captcha edits take effect immediately.
+  // The composer drafts via AI when configured and falls back to the template
+  // on any failure, so `message` is always populated.
+  const composed = await composer.compose({
     ...listing,
     _contact: currentConfig.persona,
   });
+  const message = composed.text;
+  if (composed.source === 'ai') {
+    emit({ type: 'ai_message', exposeId: listing.expose_id, attempt: composed.attempt, language: composed.language });
+  } else if (composed.errors.length > 0) {
+    log(`  AI compose unavailable — using template (${composed.errors.join('; ')})`);
+    emit({ type: 'ai_fallback', exposeId: listing.expose_id, errors: composed.errors });
+  }
 
   if (DRY_RUN) {
     log(`  [DRY RUN] Would apply to: ${listing.title} (${listing.expose_id})`);
@@ -906,6 +917,14 @@ function setupIpc(db) {
         log('Config hot-reload: message template updated');
         changed = true;
       }
+      if (msg.ai) {
+        currentConfig.ai = msg.ai;
+        // Drops cached harness processes so the next draft uses the new
+        // command/model/prompt.
+        composer?.updateConfig(currentConfig);
+        log(`Config hot-reload: AI config updated (enabled=${Boolean(msg.ai.enabled)}, provider=${msg.ai.provider || 'acp'}, primary=${msg.ai.primary?.harness_id || 'unset'})`);
+        changed = true;
+      }
       if (msg.captcha) {
         if (!currentConfig.captcha) currentConfig.captcha = {};
         mergePatch(currentConfig.captcha, msg.captcha);
@@ -972,6 +991,11 @@ async function main() {
   // Load config
   currentConfig = loadConfig();
   log(`Config loaded: ${currentConfig.persona?.email || 'unknown'}, speed=${currentConfig.timing?.speed || 'balanced'}`);
+
+  composer = new MessageComposer({ config: currentConfig, log });
+  log(currentConfig.ai?.enabled
+    ? `AI message composition enabled (provider=${currentConfig.ai.provider || 'acp'}, primary=${currentConfig.ai.primary?.harness_id || 'unset'}, fallback=${currentConfig.ai.fallback?.harness_id || 'none'})`
+    : 'AI message composition disabled — using message template');
 
   // Open database
   const db = new HomelanderDB(DB_PATH);
@@ -1058,7 +1082,9 @@ process.on('message', (msg) => {
   }
 });
 
-// Ensure DB handles are closed before the process exits (prevents EBUSY on Windows)
+// Ensure DB handles and any spawned AI harness are closed before the process
+// exits (prevents EBUSY on Windows and orphaned harness processes)
 process.on('exit', () => {
   try { _db?.close?.(); } catch (_) {}
+  try { composer?.dispose?.(); } catch (_) {}
 });

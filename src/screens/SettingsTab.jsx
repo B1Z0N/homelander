@@ -60,6 +60,14 @@ export default function SettingsTab() {
   const [timingDraft, setTimingDraft] = useState({ speed: 'balanced', poll_interval: 10, exclude_tauschwohnungen: true });
   const [captchaDraft, setCaptchaDraft] = useState('');
   const [showCaptcha, setShowCaptcha] = useState(false);
+  const [aiDraft, setAiDraft] = useState(null);
+  const [showAiKey, setShowAiKey] = useState(false);
+  const [aiTest, setAiTest] = useState(null); // { busy } | { text } | { error }
+  const [harnesses, setHarnesses] = useState([]);
+  // Per-slot probe results: { [slot]: 'loading' | { models, thoughtLevels } }
+  const [aiOptions, setAiOptions] = useState({});
+  // The built-in prompt, fetched once so Reset has something to restore to.
+  const [defaultPrompt, setDefaultPrompt] = useState(null);
   const [cleanupStep, setCleanupStep] = useState(null); // null | 'confirm' | 'purging'
   const [cleanupEmail, setCleanupEmail] = useState('');
   const [cleanupError, setCleanupError] = useState(null);
@@ -115,7 +123,38 @@ export default function SettingsTab() {
       exclude_tauschwohnungen: config.polling?.exclude_tauschwohnungen ?? true,
     });
     setCaptchaDraft(config.captcha?.api_key || '');
+    const ai = config.ai || {};
+    const slot = (v = {}) => ({
+      harness_id: v.harness_id || '',
+      command: v.command || '',
+      args: Array.isArray(v.args) ? v.args.join(' ') : (v.args || ''),
+      model: v.model || '',
+      thought_level: v.thought_level || '',
+    });
+    setAiDraft({
+      enabled: Boolean(ai.enabled),
+      provider: ai.provider || 'acp',
+      timeout_seconds: ai.timeout_seconds ?? 90,
+      prompt: ai.prompt || '',   // filled from the built-in default once fetched
+      primary: slot(ai.primary),
+      fallback: slot(ai.fallback),
+      base_url: ai.base_url || '',
+      api_key: ai.api_key || '',
+    });
   }, [config]);
+
+  // Scan for installed ACP harnesses once — a PATH scan, cheap and side-effect free.
+  useEffect(() => {
+    if (!window.homelander?.detectAiHarnesses) return;
+    let cancelled = false;
+    window.homelander.detectAiHarnesses().then((res) => {
+      if (!cancelled) setHarnesses((res?.harnesses || []).filter((h) => h.detected));
+    });
+    window.homelander.getDefaultAiPrompt?.().then((res) => {
+      if (!cancelled && res?.prompt) setDefaultPrompt(res);
+    });
+    return () => { cancelled = true; };
+  }, []);
 
   const save = async (patch) => {
     if (!window.homelander) {
@@ -175,6 +214,96 @@ export default function SettingsTab() {
   // ── Template handlers ────────────────────────────────────────────
 
   const saveTemplate = () => save({ message_template: templateDraft });
+
+  // ── AI handlers ──────────────────────────────────────────────────
+
+  const aiPatchFromDraft = () => {
+    const slot = (v) => ({
+      harness_id: v.harness_id,
+      command: v.command.trim(),
+      // Args are edited as one line; split on whitespace (no shell quoting).
+      args: v.args.trim() ? v.args.trim().split(/\s+/) : [],
+      model: v.model,
+      thought_level: v.thought_level,
+    });
+    return {
+      ...aiDraft,
+      primary: slot(aiDraft.primary),
+      fallback: slot(aiDraft.fallback),
+      timeout_seconds: Math.max(10, parseInt(aiDraft.timeout_seconds, 10) || 90),
+    };
+  };
+
+  const updateAiField = (field, value) => {
+    setAiDraft((prev) => ({ ...prev, [field]: value }));
+    setAiTest(null);
+  };
+
+  const updateAiSlot = (slot, patch) => {
+    setAiDraft((prev) => ({ ...prev, [slot]: { ...prev[slot], ...patch } }));
+    setAiTest(null);
+  };
+
+  // Picking a harness clears model/thought level: the previous harness's
+  // values are meaningless to the new one (Codex has no Sonnet).
+  const selectHarness = (slot, harnessId) => {
+    const harness = harnesses.find((h) => h.id === harnessId);
+    setAiOptions((prev) => ({ ...prev, [slot]: undefined }));
+    updateAiSlot(slot, {
+      harness_id: harnessId,
+      command: harness?.command || '',
+      args: (harness?.args || []).join(' '),
+      model: '',
+      thought_level: '',
+    });
+  };
+
+  /**
+   * Ask the harness what it offers (spawns it, so it is explicit). Preselects
+   * the first model when nothing valid is chosen yet.
+   */
+  const probeHarness = async (slot) => {
+    if (!window.homelander?.probeAiHarness) return;
+    setAiOptions((prev) => ({ ...prev, [slot]: 'loading' }));
+    const patch = aiPatchFromDraft();
+    const res = await window.homelander.probeAiHarness({ ai: patch, attempt: patch[slot] });
+    const models = res?.models || [];
+    const thoughtLevels = res?.thoughtLevels || [];
+    setAiOptions((prev) => ({ ...prev, [slot]: { models, thoughtLevels, error: res?.error ? userErrorText(res.userError || res, { operation: 'ai:probe' }, t) : null } }));
+
+    setAiDraft((prev) => {
+      const current = prev[slot];
+      const next = { ...current };
+      if (models.length > 0 && !models.some((m) => m.value === current.model)) {
+        next.model = res.currentModel && models.some((m) => m.value === res.currentModel)
+          ? res.currentModel
+          : models[0].value;
+      }
+      if (thoughtLevels.length > 0 && !thoughtLevels.some((l) => l.value === current.thought_level)) {
+        next.thought_level = res.currentThoughtLevel && thoughtLevels.some((l) => l.value === res.currentThoughtLevel)
+          ? res.currentThoughtLevel
+          : thoughtLevels[0].value;
+      }
+      return { ...prev, [slot]: next };
+    });
+  };
+
+  const resetAiPrompt = () => {
+    if (defaultPrompt?.prompt) updateAiField('prompt', defaultPrompt.prompt);
+  };
+
+  const saveAi = () => save({ ai: aiPatchFromDraft() });
+
+  const testAi = async () => {
+    if (!window.homelander?.testAiMessage) {
+      setAiTest({ error: userErrorText('Backend unavailable', { code: 'BACKEND_UNAVAILABLE' }, t) });
+      return;
+    }
+    setAiTest({ busy: true });
+    const res = await window.homelander.testAiMessage({ ai: aiPatchFromDraft() });
+    if (res?.ok) setAiTest({ text: res.text, attempt: res.attempt, language: res.language });
+    else setAiTest({ error: userErrorText(res?.userError || res, { operation: 'ai:test' }, t) });
+  };
 
   // ── Timing handlers ──────────────────────────────────────────────
   // ── Timing handlers ──────────────────────────────────────────────
@@ -458,6 +587,237 @@ export default function SettingsTab() {
             {t('settings.save', 'Save')}
           </button>
         </div>
+      </Section>
+
+      {/* ── 2b. AI message composition ───────────────────────────── */}
+      <Section title={t('settings.ai.title')}>
+        {aiDraft ? (
+          <div className="space-y-3">
+            <div>
+              <label className="flex items-center gap-1.5 text-sm cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={aiDraft.enabled}
+                  onChange={(e) => updateAiField('enabled', e.target.checked)}
+                  className="cursor-pointer"
+                />
+                {t('settings.ai.enable')}
+              </label>
+              <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>{t('settings.ai.enableDesc')}</p>
+            </div>
+
+            {aiDraft.enabled && (
+              <>
+                <div className="flex gap-3">
+                  <div className="flex-1">
+                    <label className="text-xs mb-1 block" style={{ color: 'var(--text-muted)' }}>{t('settings.ai.provider')}</label>
+                    <select
+                      className="select text-sm w-full"
+                      value={aiDraft.provider}
+                      onChange={(e) => updateAiField('provider', e.target.value)}
+                    >
+                      <option value="acp">{t('settings.ai.providerAcp')}</option>
+                      <option value="openai-compatible">{t('settings.ai.providerOpenAi')}</option>
+                    </select>
+                  </div>
+                  <div style={{ width: '9rem' }}>
+                    <label className="text-xs mb-1 block" style={{ color: 'var(--text-muted)' }}>{t('settings.ai.timeout')}</label>
+                    <input
+                      className="input text-sm w-full"
+                      type="number"
+                      min="10"
+                      value={aiDraft.timeout_seconds}
+                      onChange={(e) => updateAiField('timeout_seconds', e.target.value)}
+                    />
+                  </div>
+                </div>
+
+                {aiDraft.provider === 'openai-compatible' && (
+                  <div className="space-y-3">
+                    <div>
+                      <label className="text-xs mb-1 block" style={{ color: 'var(--text-muted)' }}>{t('settings.ai.baseUrl')}</label>
+                      <input
+                        className="input text-sm w-full font-mono"
+                        value={aiDraft.base_url}
+                        onChange={(e) => updateAiField('base_url', e.target.value)}
+                        placeholder="https://api.openai.com/v1"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs mb-1 block" style={{ color: 'var(--text-muted)' }}>{t('settings.ai.apiKey')}</label>
+                      <input
+                        className="input text-sm w-full font-mono"
+                        type={showAiKey ? 'text' : 'password'}
+                        value={aiDraft.api_key}
+                        onChange={(e) => updateAiField('api_key', e.target.value)}
+                        placeholder={t('settings.ai.apiKeyPlaceholder')}
+                      />
+                      <label className="flex items-center gap-1.5 mt-1.5 cursor-pointer text-xs" style={{ color: 'var(--text-muted)' }}>
+                        <input type="checkbox" checked={showAiKey} onChange={(e) => setShowAiKey(e.target.checked)} />
+                        {t('settings.showKey')}
+                      </label>
+                    </div>
+                    <p className="text-xs" style={{ color: 'var(--text-muted)' }}>{t('settings.ai.openAiDesc')}</p>
+                  </div>
+                )}
+
+                {/* Primary and fallback: each its own harness + model + reasoning level */}
+                <div className="flex gap-4">
+                  {[
+                    { slot: 'primary', label: t('settings.ai.slotPrimary') },
+                    { slot: 'fallback', label: t('settings.ai.slotFallback') },
+                  ].map(({ slot, label }) => {
+                    const draft = aiDraft[slot];
+                    const probe = aiOptions[slot];
+                    const models = probe && probe !== 'loading' ? probe.models : [];
+                    const levels = probe && probe !== 'loading' ? probe.thoughtLevels : [];
+                    const isAcp = aiDraft.provider === 'acp';
+                    return (
+                      <div className="flex-1 space-y-2" key={slot}>
+                        <p className="text-xs font-semibold" style={{ color: 'var(--text-secondary)' }}>{label}</p>
+
+                        {isAcp && (
+                          <div>
+                            <label className="text-xs mb-1 block" style={{ color: 'var(--text-muted)' }}>{t('settings.ai.harness')}</label>
+                            <select
+                              className="select text-sm w-full"
+                              value={draft.harness_id}
+                              onChange={(e) => selectHarness(slot, e.target.value)}
+                            >
+                              <option value="">{slot === 'fallback' ? t('settings.ai.harnessNoneOption') : t('settings.ai.harnessChoose')}</option>
+                              {harnesses.map((h) => (
+                                <option key={h.id} value={h.id}>{h.label}</option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
+
+                        <div>
+                          <label className="text-xs mb-1 block" style={{ color: 'var(--text-muted)' }}>{t('settings.ai.model')}</label>
+                          {models.length > 0 ? (
+                            <select
+                              className="select text-sm w-full"
+                              value={draft.model}
+                              onChange={(e) => updateAiSlot(slot, { model: e.target.value })}
+                            >
+                              {models.map((m) => (
+                                <option key={m.value} value={m.value}>{m.name}</option>
+                              ))}
+                            </select>
+                          ) : (
+                            <input
+                              className="input text-sm w-full font-mono"
+                              value={draft.model}
+                              onChange={(e) => updateAiSlot(slot, { model: e.target.value })}
+                              placeholder={t('settings.ai.modelPlaceholder')}
+                            />
+                          )}
+                        </div>
+
+                        <div>
+                          <label className="text-xs mb-1 block" style={{ color: 'var(--text-muted)' }}>{t('settings.ai.thoughtLevel')}</label>
+                          <select
+                            className="select text-sm w-full"
+                            value={draft.thought_level}
+                            onChange={(e) => updateAiSlot(slot, { thought_level: e.target.value })}
+                            disabled={levels.length === 0}
+                          >
+                            {/* The harness's own list only — it already ships
+                                whatever default entry it wants to offer. */}
+                            {levels.map((l) => (
+                              <option key={l.value} value={l.value}>{l.name}</option>
+                            ))}
+                          </select>
+                        </div>
+
+                        {isAcp && draft.command && (
+                          <div className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                            {probe === 'loading' ? (
+                              <span>{t('settings.ai.modelsLoading')}</span>
+                            ) : probe && models.length === 0 ? (
+                              <span>{probe.error || t('settings.ai.modelsNone')}</span>
+                            ) : (
+                              <button className="btn btn-ghost text-xs" onClick={() => probeHarness(slot)}>
+                                {t('settings.ai.modelsLoad')}
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {aiDraft.provider === 'acp' && (
+                  <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                    {harnesses.length === 0 ? t('settings.ai.harnessNone') : t('settings.ai.acpDesc')}
+                  </p>
+                )}
+
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-xs" style={{ color: 'var(--text-muted)' }}>{t('settings.ai.prompt')}</label>
+                    <button
+                      className="btn btn-ghost text-xs"
+                      onClick={resetAiPrompt}
+                      disabled={!defaultPrompt || aiDraft.prompt === defaultPrompt.prompt}
+                    >
+                      {t('settings.ai.promptReset')}
+                    </button>
+                  </div>
+                  <textarea
+                    className="input resize-y text-sm font-mono leading-6"
+                    rows={16}
+                    value={aiDraft.prompt || defaultPrompt?.prompt || ''}
+                    onChange={(e) => updateAiField('prompt', e.target.value)}
+                  />
+                  <div className="mt-2 flex gap-2 items-center flex-wrap">
+                    <span className="text-xs" style={{ color: 'var(--text-muted)' }}>{t('settings.ai.promptVariables')}</span>
+                    {(defaultPrompt?.variables || []).map((v) => (
+                      <code
+                        key={v}
+                        className="text-xs px-1.5 py-0.5 rounded"
+                        style={{ background: 'var(--bg-secondary)', color: 'var(--accent)' }}
+                      >
+                        {`{{${v}}}`}
+                      </code>
+                    ))}
+                  </div>
+                  <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>{t('settings.ai.promptDesc')}</p>
+                </div>
+
+                <p className="text-xs" style={{ color: 'var(--text-muted)' }}>{t('settings.ai.languageNote')}</p>
+                <p className="text-xs" style={{ color: 'var(--text-muted)' }}>{t('settings.ai.fallbackNote')}</p>
+
+                {aiTest && (
+                  <div className="p-3 rounded-lg" style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)' }}>
+                    {aiTest.busy && <p className="text-xs" style={{ color: 'var(--text-muted)' }}>{t('settings.ai.testing')}</p>}
+                    {aiTest.error && <p className="text-xs" style={{ color: 'var(--danger)' }}>{aiTest.error}</p>}
+                    {aiTest.text && (
+                      <>
+                        <p className="text-xs mb-1.5" style={{ color: 'var(--text-muted)' }}>{t('settings.ai.testResult')}</p>
+                        <span className="text-sm whitespace-pre-wrap">{aiTest.text}</span>
+                      </>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+
+            <div className="pt-1 flex gap-2">
+              <button className="btn btn-primary text-xs" onClick={saveAi}>
+                {t('settings.save', 'Save')}
+              </button>
+              {aiDraft.enabled && (
+                <button className="btn text-xs" onClick={testAi} disabled={Boolean(aiTest?.busy)}>
+                  {t('settings.ai.test')}
+                </button>
+              )}
+            </div>
+          </div>
+        ) : (
+          <p className="text-sm" style={{ color: 'var(--text-muted)' }}>{t('settings.loadingConfig', 'Loading configuration…')}</p>
+        )}
       </Section>
 
       {/* ── 3. Timing ────────────────────────────────────────────── */}
