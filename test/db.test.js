@@ -88,7 +88,7 @@ describe('HomelanderDB constructor', () => {
   it('records schema version', () => {
     const db = freshDB();
     const row = db.db.prepare('SELECT version FROM schema_version').get();
-    assert.equal(row.version, 4);
+    assert.equal(row.version, 5);
     db.close();
   });
 
@@ -148,7 +148,7 @@ describe('HomelanderDB constructor', () => {
       const db = new HomelanderDB(file);
       assert.equal(db.getFilter('old-polled').first_poll_done, 1);
       assert.equal(db.getFilter('old-new').first_poll_done, 0);
-      assert.equal(db.db.prepare('SELECT version FROM schema_version').get().version, 4);
+      assert.equal(db.db.prepare('SELECT version FROM schema_version').get().version, 5);
       db.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });

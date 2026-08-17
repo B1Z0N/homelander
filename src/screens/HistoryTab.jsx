@@ -6,7 +6,7 @@ import { useLocale } from '../locales/LocaleContext';
 import { ExternalLinkIcon, RetryIcon } from '../shared/Icons';
 import { swallow } from '../shared/logCatch.js';
 import { useStore } from '../stores/appStore';
-import { userErrorText } from '../shared/userErrors';
+import { userErrorText, redact } from '../shared/userErrors';
 
 const PAGE_SIZE = 30;
 const OUTCOME_KEYS = [
@@ -120,6 +120,10 @@ function HistoryEntry({ listing, isExpanded, onToggle, onRetry, retrying, onSupp
 
   const badgeClass = isSent ? 'badge-success' : isDeactivated ? 'badge-deactivated' : isPremium ? 'badge-premium' : isDryRun ? '' : 'badge-fail';
   const safeDetail = listing.detail ? userErrorText(listing.detail, { operation: 'listing apply' }, t) : '';
+  const isError = outcome === 'ERROR';
+  const rawDetail = isError && listing.detail ? redact(listing.detail) : '';
+  const hasRawDetail = rawDetail && rawDetail !== safeDetail;
+  const detailCopyText = hasRawDetail ? `${safeDetail}\n\n${rawDetail}` : safeDetail;
 
   return (
     <div
@@ -305,17 +309,20 @@ function HistoryEntry({ listing, isExpanded, onToggle, onRetry, retrying, onSupp
                   className="mt-0.5 p-2 rounded text-xs whitespace-pre-wrap"
                   style={{
                     background: 'var(--bg-secondary)',
-                    color: copied === safeDetail ? 'var(--success)' : 'var(--text-secondary)',
+                    color: copied === detailCopyText ? 'var(--success)' : 'var(--text-secondary)',
                     border: '1px solid var(--border)',
                     cursor: 'pointer',
                   }}
                   onClick={(e) => {
                     e.stopPropagation();
-                    navigator.clipboard.writeText(safeDetail).catch((err) => { swallow(err, 'renderer/clipboard-detail'); });
-                    setCopied(safeDetail);
+                    navigator.clipboard.writeText(detailCopyText).catch((err) => { swallow(err, 'renderer/clipboard-detail'); });
+                    setCopied(detailCopyText);
                     setTimeout(() => setCopied(null), 1500);
                   }}
-                  title={t('history.clickToCopy', 'Click to copy')}
+                  onMouseEnter={hasRawDetail ? (e) => { e.stopPropagation(); onTipShow(rawDetail, e); } : undefined}
+                  onMouseMove={hasRawDetail ? (e) => { e.stopPropagation(); onTipMove(e); } : undefined}
+                  onMouseLeave={hasRawDetail ? onTipHide : undefined}
+                  title={hasRawDetail ? undefined : t('history.clickToCopy', 'Click to copy')}
                 >
                   {safeDetail}
                 </p>

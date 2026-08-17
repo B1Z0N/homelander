@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import { mkdirSync } from 'node:fs';
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -114,6 +114,15 @@ export class HomelanderDB {
           SELECT DISTINCT expose_id
           FROM listings
           WHERE outcome = 'MANUAL' AND expose_id IS NOT NULL AND expose_id != '';
+        `);
+      }
+      if (version && version.version < 5) {
+        // FAIL rows caused by a thrown exception (failure_reason = 'error') are
+        // reclassified as ERROR — distinct from domain outcomes like
+        // DEACTIVATED/PREMIUM or expected apply-blocking reasons (captcha, etc).
+        this.db.exec(`
+          UPDATE listings SET outcome = 'ERROR' WHERE outcome = 'FAIL' AND failure_reason = 'error';
+          UPDATE results SET outcome = 'ERROR' WHERE outcome = 'FAIL' AND detail LIKE 'ERROR:%';
         `);
       }
       this.db.exec('DELETE FROM schema_version');
@@ -343,7 +352,7 @@ export class HomelanderDB {
   retryAllFailed(filterId = null) {
     let sql = `UPDATE listings SET status = 'seen', outcome = NULL, detail = NULL,
       failure_reason = NULL, sent_at = NULL
-      WHERE outcome IN ('FAIL', 'SUBMIT_FAILED', 'SESSION_EXPIRED', 'CAPTCHA')
+      WHERE outcome IN ('FAIL', 'ERROR', 'SUBMIT_FAILED', 'SESSION_EXPIRED', 'CAPTCHA')
       AND (detail IS NULL OR (detail NOT LIKE '%premium%' AND detail NOT LIKE '%deactivated%'))
       AND (failure_reason IS NULL OR (failure_reason NOT LIKE '%premium%' AND failure_reason NOT LIKE '%deactivated%'))`;
     const params = [];
@@ -370,8 +379,10 @@ export class HomelanderDB {
         sql += ' AND (outcome = \'PREMIUM\' OR failure_reason LIKE ? OR detail LIKE ? OR detail LIKE ?)';
         params.push('%premium%', '%premium%', '%Suchen+%');
       } else if (outcome === 'FAIL') {
-        // Match the same "pure failed" definition used in getStats/getTodayStats
-        sql += ' AND outcome = \'FAIL\' AND outcome NOT IN (\'DEACTIVATED\', \'PREMIUM\') AND failure_reason NOT LIKE ? AND detail NOT LIKE ? AND detail NOT LIKE ?';
+        // Match the same "pure failed" definition used in getStats/getTodayStats.
+        // ERROR (thrown exception / unrelated infra failure) reuses the same
+        // "Failed" pill in the UI, so it's included here too.
+        sql += ' AND outcome IN (\'FAIL\', \'ERROR\') AND outcome NOT IN (\'DEACTIVATED\', \'PREMIUM\') AND failure_reason NOT LIKE ? AND detail NOT LIKE ? AND detail NOT LIKE ?';
         params.push('%premium%', '%premium%', '%Suchen+%');
       } else {
         sql += ' AND outcome = ?';
@@ -406,6 +417,7 @@ export class HomelanderDB {
                            AND detail NOT LIKE '%Suchen+%'
                          THEN 1 ELSE 0 END), 0) as failed,
         COALESCE(SUM(CASE WHEN (failure_reason LIKE '%captcha%' OR detail LIKE '%captcha%') THEN 1 ELSE 0 END), 0) as captcha,
+        COALESCE(SUM(CASE WHEN outcome = 'ERROR' THEN 1 ELSE 0 END), 0) as error,
         COALESCE(SUM(CASE WHEN status = 'seen' THEN 1 ELSE 0 END), 0) as seen_unapplied,
         COALESCE(SUM(CASE WHEN status = 'sent' AND outcome != 'MANUAL' AND date(sent_at, 'localtime') = date('now', 'localtime') THEN 1 ELSE 0 END), 0) as today
       FROM listings${whereFilter}
@@ -414,7 +426,7 @@ export class HomelanderDB {
     return {
       total: row.total, sent: row.sent, failed: row.failed,
       deactivated: row.deactivated, premium: row.premium, captcha: row.captcha,
-      seen_unapplied: row.seen_unapplied, today: row.today,
+      error: row.error, seen_unapplied: row.seen_unapplied, today: row.today,
     };
   }
 
@@ -440,6 +452,7 @@ export class HomelanderDB {
                            AND detail NOT LIKE '%Suchen+%'
                          THEN 1 ELSE 0 END), 0) as failed,
         COALESCE(SUM(CASE WHEN (failure_reason LIKE '%captcha%' OR detail LIKE '%captcha%') THEN 1 ELSE 0 END), 0) as captcha,
+        COALESCE(SUM(CASE WHEN outcome = 'ERROR' THEN 1 ELSE 0 END), 0) as error,
         COALESCE(SUM(CASE WHEN status = 'sent' AND outcome != 'MANUAL' THEN 1 ELSE 0 END), 0) as today
       FROM listings WHERE date(sent_at, 'localtime') = date('now', 'localtime')${whereFilter}
     `).get(...filterParam);
@@ -452,7 +465,7 @@ export class HomelanderDB {
     return {
       total: row.total, sent: row.sent, failed: row.failed,
       deactivated: row.deactivated, premium: row.premium, captcha: row.captcha,
-      seen_unapplied: seenUnapplied.count, today: row.today,
+      error: row.error, seen_unapplied: seenUnapplied.count, today: row.today,
     };
   }
 

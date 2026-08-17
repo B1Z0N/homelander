@@ -366,7 +366,7 @@ async function applyOne(listing, filterId, db) {
         : isError ? 'error'
         : 'unknown';
 
-      const outcome = isDeactivated ? 'DEACTIVATED' : isPremium ? 'PREMIUM' : 'FAIL';
+      const outcome = isDeactivated ? 'DEACTIVATED' : isPremium ? 'PREMIUM' : isError ? 'ERROR' : 'FAIL';
       db.markSent(listing.hash, outcome, reason, failureReason);
       const logIcon = isDeactivated ? '◌' : isPremium ? '💎' : '✗';
       log(`  ${logIcon} ${outcome} | ${listing.expose_id} | ${listing.title} | ${reason}`);
@@ -436,12 +436,12 @@ async function applyOne(listing, filterId, db) {
       return;
     }
 
-    db.markSent(listing.hash, 'FAIL', `ERROR: ${errMsg}`, 'error');
+    db.markSent(listing.hash, 'ERROR', `ERROR: ${errMsg}`, 'error');
     consecutiveCaptchas = 0;
 
     emit({
       type: 'listing',
-      outcome: 'FAIL',
+      outcome: 'ERROR',
       exposeId: listing.expose_id,
       title: listing.title,
       price: listing.price,

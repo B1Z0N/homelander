@@ -6,7 +6,7 @@ import { useLocale } from '../locales/LocaleContext';
 import { swallow } from '../shared/logCatch.js';
 import { useStore } from '../stores/appStore';
 import { ExternalLinkIcon, RetryIcon } from '../shared/Icons';
-import { userErrorText } from '../shared/userErrors';
+import { userErrorText, redact } from '../shared/userErrors';
 
 function formatTime(iso) {
   if (!iso) return '';
@@ -197,7 +197,11 @@ export default function ActivityFeed() {
           || failureReason.toLowerCase().includes('premium');
         const isCaptcha = (item.detail || '').toLowerCase().includes('captcha')
           || failureReason.toLowerCase().includes('captcha');
+        const isError = item.outcome === 'ERROR';
         const safeDetail = item.detail ? userErrorText(item.detail, { operation: 'listing apply' }, t) : '';
+        const rawDetail = isError && item.detail ? redact(item.detail) : '';
+        const hasRawDetail = rawDetail && rawDetail !== safeDetail;
+        const detailCopyText = hasRawDetail ? `${safeDetail}\n\n${rawDetail}` : safeDetail;
         const statusColor = isSent ? 'var(--success)' : isDeactivated ? 'var(--text-muted)' : isPremium ? '#a855f7' : 'var(--danger)';
         const statusIcon = isSent ? '✓' : isDeactivated ? '⊘' : isPremium ? '💎' : '✗';
         const outcomeLabel = isSent ? t('livefeed.sent', 'Sent') : isDeactivated ? t('livefeed.deactivated', 'Deactivated') : isPremium ? t('livefeed.premium', 'Premium') : t('livefeed.failed', 'Failed');
@@ -362,12 +366,15 @@ export default function ActivityFeed() {
                         className="mt-0.5 p-2 rounded text-xs whitespace-pre-wrap"
                         style={{
                           background: 'var(--bg-secondary)',
-                          color: copied === safeDetail ? 'var(--success)' : 'var(--text-secondary)',
+                          color: copied === detailCopyText ? 'var(--success)' : 'var(--text-secondary)',
                           border: '1px solid var(--border)',
                           cursor: 'pointer',
                         }}
-                        onClick={(e) => { e.stopPropagation(); handleCopy(safeDetail); }}
-                        title={t('livefeed.clickToCopy', 'Click to copy')}
+                        onClick={(e) => { e.stopPropagation(); handleCopy(detailCopyText); }}
+                        onMouseEnter={hasRawDetail ? (e) => { e.stopPropagation(); showTip(rawDetail, e); } : undefined}
+                        onMouseMove={hasRawDetail ? moveTip : undefined}
+                        onMouseLeave={hasRawDetail ? hideTip : undefined}
+                        title={hasRawDetail ? undefined : t('livefeed.clickToCopy', 'Click to copy')}
                       >{safeDetail}</p>
                     </div>
                   )}
@@ -433,4 +440,3 @@ export default function ActivityFeed() {
     </div>
   );
 }
-
