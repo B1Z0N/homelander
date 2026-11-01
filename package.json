@@ -52,7 +52,7 @@
     "@puppeteer/browsers": "^2.13.2",
     "better-sqlite3": "^12.11.1",
     "koffi": "^3.0.2",
-    "puppeteer": "^24.0.0",
+    "puppeteer": "^25.16.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "zustand": "^5.0.0"
